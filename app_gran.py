@@ -17,13 +17,15 @@ Règle d'arrondi TVA : au moment de la validation de la grille, les deux
 montants (HT et TTC) sont figés et stockés. Aucun recalcul en boucle, ce qui
 évite les dérives d'un centime au retour de conversion.
 
-Persistance : session uniquement (Streamlit Cloud a un système de fichiers
-éphémère). L'archivage se fait par export/import Excel.
+Persistance : Supabase (grille et historique partagés) lorsque les secrets
+serveur sont configurés. Repli explicite en session seule sans configuration.
 
 Usage interne équipe commerciale.
 """
 
 import io
+import hashlib
+import hmac
 import math
 import os
 import re
@@ -38,6 +40,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from granules_store import SupabaseStore, StoreError, encode_state, decode_state
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION MÉTIER — tout ce qui change se modifie ICI
@@ -1536,8 +1539,89 @@ def charger_grille_versionnee():
     ss["auto_grille_msgs"] = msgs
 
 
+def secret_serveur(nom):
+    try:
+        return str(st.secrets.get(nom, os.environ.get(nom, ""))).strip()
+    except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+        return os.environ.get(nom, "").strip()
+
+
+def connexion_supabase():
+    url = secret_serveur("SUPABASE_URL")
+    cle = secret_serveur("SUPABASE_SECRET_KEY") or secret_serveur("SUPABASE_SERVICE_ROLE_KEY")
+    if not url and not cle:
+        return None
+    if not url or not cle:
+        st.error("Configuration Supabase incomplète : renseignez SUPABASE_URL et SUPABASE_SECRET_KEY dans les secrets Streamlit.")
+        st.stop()
+    mot_de_passe = secret_serveur("GRANULES_APP_PASSWORD")
+    if len(mot_de_passe) < 16:
+        st.error("Définissez GRANULES_APP_PASSWORD (au moins 16 caractères) dans les secrets Streamlit pour protéger les données partagées.")
+        st.stop()
+    empreinte = hashlib.sha256(mot_de_passe.encode()).hexdigest()
+    if st.session_state.get("granules_acces") != empreinte:
+        st.title("🌿 Hympyr Énergies — Cockpit granulés")
+        st.caption("Accès réservé à l'équipe. Utilisez le mot de passe transmis en interne.")
+        with st.form("connexion_equipe"):
+            saisi = st.text_input("Mot de passe d'équipe", type="password")
+            valide = st.form_submit_button("Se connecter", type="primary")
+        if valide:
+            if hmac.compare_digest(hashlib.sha256(saisi.encode()).hexdigest(), empreinte):
+                st.session_state["granules_acces"] = empreinte
+                st.rerun()
+            st.error("Mot de passe incorrect.")
+        st.stop()
+    try:
+        return SupabaseStore(url, cle)
+    except StoreError as exc:
+        st.error(str(exc))
+        st.stop()
+
+
+def charger_supabase():
+    if base_supabase is None or st.session_state.get("supabase_chargee"):
+        return
+    try:
+        ligne = base_supabase.load()
+        # Validate the complete payload before touching session state.
+        donnees = decode_state(ligne["payload"], COLONNES) if ligne["payload"] is not None else {}
+        st.session_state.update(donnees)
+        st.session_state.update({"supabase_revision": ligne["revision"],
+                                 "supabase_chargee": True, "supabase_non_sauve": False,
+                                 "supabase_vide": ligne["payload"] is None})
+    except (StoreError, ValueError, KeyError, TypeError) as exc:
+        st.error(f"Chargement de la base impossible : {exc}")
+        st.info("Le simulateur ne démarre pas sur des tarifs par défaut si une base configurée est inaccessible.")
+        if st.button("Réessayer la connexion"):
+            st.rerun()
+        st.stop()
+
+
+def sauvegarder_supabase():
+    if base_supabase is None:
+        return
+    st.session_state["supabase_non_sauve"] = True
+    try:
+        revision = base_supabase.save(encode_state(st.session_state), st.session_state["supabase_revision"])
+        st.session_state.update({"supabase_revision": revision, "supabase_non_sauve": False,
+                                 "supabase_vide": False})
+    except (StoreError, ValueError, KeyError, TypeError) as exc:
+        st.error(f"Sauvegarde non confirmée : {exc}")
+        st.info("Vos données restent disponibles dans cette session. Vous pouvez les exporter en Excel. Le bouton de sauvegarde de la barre latérale permet de réessayer.")
+        # Do not claim success, rerun, or discard local work after a failed write.
+        return False
+    return True
+
+
+def sauver_ou_arreter():
+    if sauvegarder_supabase() is False:
+        st.stop()
+
+
+base_supabase = connexion_supabase()
 init_state()
 charger_grille_versionnee()
+charger_supabase()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STYLE
@@ -1626,8 +1710,28 @@ with st.sidebar:
         if not _d.empty:
             st.caption(f"{_h['acteur'].nunique()} acteur(s) · "
                        f"{_d.min():%d/%m/%y} → {_d.max():%d/%m/%y}")
-    st.caption("⚠️ Les données ne survivent pas à la fermeture de l'onglet. "
-               "Exportez le classeur Excel pour archiver, réimportez-le pour reprendre.")
+    if base_supabase is None:
+        st.warning("Mode session seule : Supabase n'est pas configuré. Exportez vos données avant de fermer l'outil.")
+    else:
+        st.caption(f"Base Supabase · version {st.session_state['supabase_revision']}")
+        if st.session_state.get("supabase_non_sauve"):
+            st.warning("Modifications en session : sauvegarde non confirmée.")
+        elif st.session_state.get("supabase_vide"):
+            st.info("La base est vide. Enregistrez la grille actuelle ou importez votre classeur pour l'initialiser.")
+        else:
+            st.success("Grille et historique chargés depuis Supabase.")
+        if st.button("💾 Enregistrer l'état actuel"):
+            sauver_ou_arreter()
+            st.rerun()
+        confirmer_rechargement = st.checkbox("Abandonner les changements en session et recharger")
+        if st.button("🔄 Recharger depuis la base", disabled=not confirmer_rechargement):
+            for key in list(st.session_state):
+                if key != "granules_acces":
+                    del st.session_state[key]
+            st.rerun()
+        if st.button("Se déconnecter"):
+            st.session_state.clear()
+            st.rerun()
 
 ong1, ong2, ong3, ong4 = st.tabs([
     "🧮 Simulateur", "📋 Grille tarifaire", "📥 Données", "📊 Analyse"])
@@ -1896,10 +2000,12 @@ with ong2:
                         st.info("ℹ️ " + m)
 
             if resume:
+                sauver_ou_arreter()
                 st.success("Chargement effectué — " + " · ".join(resume) + ".")
                 st.rerun()
 
-    with st.expander("💡 Éviter de recharger à chaque session"):
+    with st.expander("💡 Sauvegarde et partage des données"):
+        st.info("Avec Supabase configuré, chaque validation, import, archivage ou suppression est sauvegardé dans la base commune. Les nouvelles sessions rechargent la base. Pour récupérer les changements d’un collègue dans une session déjà ouverte, utilisez « Recharger depuis la base ». Sans Supabase, le classeur versionné ci-dessous reste une solution de repli.")
         st.markdown(f"""
 Le fichier que vous exportez est le fichier que vous rechargez : aucun format
 supplémentaire à maintenir.
@@ -1922,7 +2028,6 @@ trois fichiers finissent par diverger.
     with t1:
         d_grille = st.date_input("Date d'effet", value=st.session_state["date_grille"],
                                  format="DD/MM/YYYY")
-        st.session_state["date_grille"] = d_grille
     with t2:
         tva_m_pct = st.number_input(
             "TVA marchandise (%)", 0.0, 30.0,
@@ -2030,11 +2135,13 @@ trois fichiers finissent par diverger.
                 st.error("Chaque tableau doit contenir au moins une ligne valide.")
             else:
                 st.session_state.update({
+                    "date_grille": d_grille,
                     "palettes": npal, "vrac": nvrac, "zones": nzones,
                     "tva_march": tva_m_saisi, "tva_livr": tva_l_saisi,
                     "base_saisie": base, "franchise_km": float(franchise_saisie),
                     "prix_km_ht": km_ht_apercu, "prix_km_ttc": km_ttc_apercu,
                     "source_grille": "Saisie manuelle dans l'application"})
+                sauver_ou_arreter()
                 st.success(f"Grille mise à jour (saisie en {base}, TVA marchandise "
                            f"{taux_fmt(tva_m_saisi)}, TVA livraison "
                            f"{taux_fmt(tva_l_saisi)}). Le simulateur utilise ces "
@@ -2089,6 +2196,7 @@ trois fichiers finissent par diverger.
             st.session_state["historique"] = dedoublonner(
                 pd.concat([st.session_state["historique"], nouv], ignore_index=True),
                 st.session_state["tva_march"])
+            sauver_ou_arreter()
             st.success(f"{len(nouv)} lignes archivées au "
                        f"{pd.Timestamp(st.session_state['date_grille']):%d/%m/%Y}.")
 
@@ -2128,6 +2236,7 @@ with ong3:
         if total_ok:
             st.session_state["historique"] = dedoublonner(
                 st.session_state["historique"], tva_ref)
+            sauver_ou_arreter()
             st.success(f"{total_ok} ligne(s) importée(s).")
         for a in avert:
             st.info("ℹ️ " + a)
@@ -2188,6 +2297,7 @@ with ong3:
                 st.session_state["historique"] = dedoublonner(
                     pd.concat([st.session_state["historique"], ligne],
                               ignore_index=True), tva_ref)
+                sauver_ou_arreter()
                 st.success(f"Relevé {s_acteur} ajouté : {eur(ht)} HT / "
                            f"{eur(ttc)} TTC.")
 
@@ -2211,8 +2321,10 @@ with ong3:
                        "écarts calculés dans l'analyse.")
             st.dataframe(coh[coh["Anomalie"]], use_container_width=True)
 
-        if st.button("🗑️ Vider les données"):
+        confirmer_vidage = st.checkbox("Confirmer la suppression de tout l’historique partagé")
+        if st.button("🗑️ Vider les données", disabled=not confirmer_vidage):
             st.session_state["historique"] = df_vide()
+            sauver_ou_arreter()
             st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
