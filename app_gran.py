@@ -46,7 +46,7 @@ from granules_store import SupabaseStore, StoreError, encode_state, decode_state
 # CONFIGURATION MÉTIER — tout ce qui change se modifie ICI
 # ══════════════════════════════════════════════════════════════════════════════
 
-ADRESSE_DEPART = "Zone d'Activité (ZA) l'Albarette 81310 Lisle-sur-Tarn"
+ADRESSE_DEPART = "490 route de Toulouse, 81370 Saint-Sulplice-la-Pointe"
 TELEPHONE = "05 61 70 03 27"
 SOCIETE = "Hympyr Énergies"
 
